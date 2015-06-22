@@ -1,0 +1,404 @@
+#Define PULLED_LOW %010
+
+To initialise_variables
+  ; initiate various variables
+	version:= 2.1
+
+	; configuration variables
+	record_duration := 24 ; how many hours of day of gps data to record
+	status_update_frequency := 1 ; how many days before sending an iridium status message
+	logging_rate := 10 ; how fast should i log data
+
+	set_baud_rate := 1; used to only set the GPS baud rate the first time its configured
+
+	; leds for displaying system status
+	Make led1 Digital($42,3)
+	Make led2 Digital($3C,3)
+	Make led4 Digital($1B,3)
+	Make led3 Digital($1C,3)
+	led1.off
+	led2.off
+	led3.off
+	led4.off
+
+	Make battery_test Digital($64,3) ; digital line to activate battery voltage measurement
+	battery_test.off
+
+	Make b1 Analogue($34) ; analogue value of battery life
+
+	Make gps Digital($68,3) ; line to power up gps (AND filesystem)
+	gps.off
+
+	Make antenna Digital($61,3) ; line to power up antenna
+	antenna.off
+
+  Make gps_serial SerialPort(57600,2,0); serial port for gps
+  Make serial_enable Digital($6B,3); line to power up serial ports
+  
+	Make msg String(200) ;field for sending status messages
+	Make position String(100) ; field for lat/lon position
+  
+  Make filename String(30) ; field for current filename
+  Make statusMessage String(100) ; field for messages to be sent via iridium
+	Make iridium_serial SerialPort(19200, 3, 0) ; serial port for iridium
+	Make iridium_power Digital($69, 3) ; line to power up iridium
+	iridium_power.off
+
+	Make IridiumMessage String(300) ; field for messages from iridium
+	Make IridiumTX String(1000) ; field for messages to iridium
+
+End
+
+To init
+
+  Local error_code
+
+  system.speed := 32 ; set clock speed at 16Mhz, slowest possible to save power
+  system.ErrorAction := 1 ; reboot on error
+  serial.escape	:= False; disable serial port escape
+
+  Make watchdogTimer Timer(100000000) ; mS
+  ; just in case everything goes wrong - this will (eventually) restart the GPS
+  
+  initialise_variables
+  
+  Make clock RealTimeClock
+  clock.Time := 0 ; just in case its not set by GPS
+
+  serial.speed := 115200
+  Global.battery_voltage := 0
+  led.off ; disable onboard microprocessor led to save a little power
+  
+  print "Project: ubi, version: ",version, CR
+  print "System processor speed: ",system.Speed,CR
+  
+
+  getBatteryVoltage
+  watchdogTimer.Go
+  low_power_cutoff ; if battery less than 10V, go to sleep for a day
+  print "Starting inititation",CR
+  
+  ; start test sequence
+  ; activate gps
+  serial_enable.On
+  antenna.On
+  gps.On
+  
+  ledFlash  ; flash all leds 9 times to show board is on
+  
+  testBattery ; test battery.  flash battery led according to Vbat.
+
+  makefs(1) ; test SD cards, look for configuration files
+	
+  Make statusMessage String(100)
+
+  watchdogTimer.Go ; reset watchdog timer
+
+  testGPS ; test the GPS - can it get a position fix?
+
+
+  if  Global.serial_stream = 0[
+    testIridium ; test the iridium, can it detect a signal
+    sendStatus
+  ]
+  Start ledAllon ; turn off leds after 1 hour
+
+  print "System test sequence completed",CR
+  print "Configuration settings",CR
+  print "Logging times :",record_duration,CR
+  print "Logging configuration :",logging_rate,CR
+  print "Status messages :",status_update_frequency,CR
+  print "Position :",position,CR
+
+  ; this is for downloading files from this device via the serial port
+  ;start serialInterface
+    
+  watchdogTimer.Go ; reset watchdog timer
+
+  Start WatchdogTask
+
+  Global.start_time := clock.time
+
+  system.low
+
+End
+
+To makefs(initialise) 
+  ; test filesystem  
+  if (initialise = 1) [ print "Starting filesystem test",CR ]
+  else [ print "Starting makefs call",CR ]
+
+  wait(2000)
+  if (initialise = 1) [
+	  led_fs_on := start ledFSSlow
+	  ;System.Debug(22,13,15) ; pre-initialise cards
+  ]
+  Make spi2 SPI(2,18000,0,2)
+
+  Global.SD1 := New FileSystem("FSD", 13 + $80)
+  Global.SD2 := New FileSystem("FSD", 15 + $80)
+
+  if (initialise = 1) [
+	  if global.SD1.Valid [
+		if SD1.Length("config.txt") > 0 [
+			print "Loading configuration file from SD1",CR
+			config_file := SD1.Open("config.txt",Char)
+			parseConfig(config_file)
+			config_file.close
+		]
+	  ]
+	  if global.SD2.Valid [
+		if SD2.Length("config.txt") > 0 [
+			print "Loading configuration file from SD2",CR
+			config_file := SD2.Open("config.txt",Char)
+			parseConfig(config_file)
+			config_file.close
+		]
+	  ]
+  ]
+ 
+  if global.SD1.valid [ if Global.SD1.free < 1000[ Global.SD1.die ] ]; free space in kb 
+  if global.SD2.valid [ if Global.SD2.free < 1000[ Global.SD2.die ] ]; free space in kb 
+  
+  print "SD1 valid ",global.SD1.Valid,CR
+  print "SD2 valid ",global.SD2.Valid,CR
+  print "Searching for valid configuration files",CR
+  
+  Global.fs := Nil
+  
+  If Global.sd1.valid global.fs := global.sd1
+  else if global.sd2.valid global.fs := global.sd2
+
+  ; make data directory if it doesn't already exist
+  global.fs.open("data",'d')
+  
+  if (initialise = 1)[
+	  Global.serial_stream := 0
+	  if (Global.fs = Nil)[
+		Global.serial_stream := 1
+		print "GPS configured for location data stream",CR
+	  ]
+  ]     
+
+  ; this is to flush data to the SD card once a minute.
+  ; more rapid flushes will make for more writes to the SD card - with potential failures
+  ; less rapid flushes and data will be lost if the card is removed prematurely.
+  if Global.fs <> Nil [
+	print "Found valid SD card, starting hourly data flush",CR
+	  s1 := Start Every 60000 [ 
+	      global.fs.Flush
+	  ]
+  ]
+  
+  print "Filesystem free space : ",Global.fs.free,CR
+  if (initialise = 1)[
+	  if (global.fs.free > 1000) [ 
+	    stop led_fs_on
+	    led2.On
+	  ]
+	  else [
+	    stop led_fs_on
+	    led_fs_on := start ledFSFast
+	  ]
+   ]
+End
+
+To testBattery ; test battery voltage
+  Print "Measuring battery voltage",CR
+  led_battery_on := start ledBatterySlow
+  getBatteryVoltage
+  If Global.battery_voltage > 10 [
+    stop led_battery_on
+    led1.On ; turn on power led
+  ]
+  Else [
+    stop led_battery_on
+    led_battery_on := start ledBatteryFast
+  ]
+End
+
+; routine to test the GPS
+To testGPS
+  gps_led_on := Start ledGPSSlow
+  Print "Testing GPS",CR
+  getPosition ; this will timeout if it fails.
+  if position.length > 0 [
+    Stop gps_led_on
+    led3.On
+  ]
+  else [
+    Stop gps_led_on
+    gps_led_on := Start ledGPSFast
+  ]
+End
+
+To low_power_cutoff
+      while Global.battery_voltage < 10 [
+	      print "Entering low power cut off mode";
+	      wait 1000
+	      gps.off ; turn off gps modem
+	      antenna.off ; turn off antenna
+	      serial_enable.off
+	      iridium_power.off
+	      led1.off
+	      led2.off
+	      led3.off
+	      led4.off
+	      
+	      i := 1
+	      while ( i < 6170 ) [ ; sleep for a day
+		clock.TimeOut(14)
+		watchdogTimer.Go
+		i := i + 1
+	      ]
+	getBatteryVoltage
+	]
+	
+End
+
+To testIridium
+  iridium_led_on := Start ledIridiumSlow
+  Print "Testing 9602?",CR
+  
+  iridium_power.on
+  Wait 3000;
+  
+  IridiumMessage.empty
+  iridium_response("AT")
+  If IridiumMessage.find("OK") = -1 [
+	iridium_update := 0
+	Print "Error wth Iridium modem"
+	iridium_power.off
+	Return 0
+  ]
+  
+   attempts := 0;
+   signal := -1
+   IridiumMessage.empty
+ 	 While signal = -1 AndAlso attempts < 100[
+		iridium_response("AT+CSQ")
+		attempts := attempts + 1
+		Print "Message",iridiumMessage,CR
+		If iridiumMessage.Find("+CSQ:3") = 0 Or iridiumMessage.Find("+CSQ:4") = 0 Or iridiumMessage.Find("+CSQ:5") = 0[
+			signal := 1
+		]
+		iridiumMessage.Empty
+	]
+ 
+    if (signal = 1) [
+ 
+      Print "9602 OK",CR
+      Stop iridium_led_on
+      led4.on
+    ]
+    else [
+       Stop iridium_led_on
+       iridium_led_on := Start ledIridiumFast
+       iridium_update := 0
+    ]
+    iridium_power.off
+End
+
+; just LED display routines from here on.
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+To ledFlash
+  gps_led_on := Start ledGPSFast
+  battery_led_on := Start ledBatteryFast
+  fs_led_on := Start ledFSFast
+  iridium_led_on := Start ledIridiumFast
+  wait 3000
+  led1.Off
+  led2.Off
+  led3.Off
+  led4.Off
+  Stop gps_led_on
+  Stop battery_led_on
+  Stop fs_led_on
+  Stop iridium_led_on
+End  
+
+
+To ledBatteryFast
+  Forever [
+    led1.Off
+    Wait 150
+    led1.On
+    Wait 150
+   ]
+End
+To ledBatterySlow
+  Forever [
+    led1.Off
+    Wait 1000
+    led1.On
+    Wait 1000
+   ]
+End
+To ledFSFast
+  Forever [
+    led2.Off
+    Wait 150
+    led2.On
+    Wait 150
+   ]
+End
+To ledFSSlow
+  Forever [
+    led2.Off
+    Wait 1000
+    led2.On
+    Wait 1000
+   ]
+End
+
+To ledGPSFast
+  Forever [
+    led3.Off
+    Wait 150
+    led3.On
+    Wait 150
+  ]
+End
+
+To ledGPSSlow
+  Forever [
+    led3.Off
+    Wait 1000
+    led3.On
+    Wait 1000
+  ]
+End
+To ledIridiumFast
+   Forever [
+    led4.Off
+    Wait 150
+    led4.On
+    Wait 150
+   ]
+End
+To ledIridiumSlow
+   Forever [
+    led4.Off
+    Wait 1000
+    led4.On
+    Wait 1000
+   ]
+End
+
+To ledAllon
+  Wait 1000*60*60
+  stopLeds
+  print "Disabling leds",CR
+End
+To stopLeds
+  Stop gps_led_on
+  Stop fs_led_on
+  Stop battery_led_on
+  
+  led1.Off
+  led2.Off
+  led3.Off
+  led4.off
+End
