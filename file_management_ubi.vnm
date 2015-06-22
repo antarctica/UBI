@@ -1,0 +1,93 @@
+#Define PULLED_LOW %010
+
+; parse a configuration file
+To parseConfig(f)
+   Autodestruct
+   Local error_code
+   config_string := New String(500) 
+   variable_name := New String(500)
+   variable_value := New String(50)
+		
+	Try[
+		While f.Get(config_string) > 0[
+			variable_name.Empty
+			variable_value.Empty
+			Print "Loading config string ",config_string,CR
+			Print To variable_name, config_string:0:config_string.Find(":")
+			Print To variable_value,config_string:config_string.Find(":",0)+1:config_string.Length
+			If variable_name.Compare("record_duration") = 0 record_duration := variable_value.Value
+			Else If variable_name.Compare("status_update_frequency") = 0 status_update_frequency := variable_value.Value
+			Else If variable_name.Compare("logging_rate") = 0 logging_rate := variable_value.Value
+			Else Print "Unrecognised configuration variable",variable_name," : ",variable_value,CR
+		]
+	]
+	Catch error_code[
+	  Print "End of file",CR
+	]
+
+    Print "Finished parsing config",CR
+    print "Settings loaded.  record_duration=",record_duration,"   status_update_frequency=",status_update_frequency,"  logging_rate=",logging_rate,CR
+End
+To saveStatus
+	AutoDestruct
+	status_record := Global.fs.Open("status_record.txt",Char)
+	Print To status_record,clock.time,": ",Global.battery_voltage," ",Global.free_space," ",Global.position,CR
+	status_record.Close
+End
+
+
+
+; create a new GPS file name
+  To newGPSFileName ; routine for creating new gps data file name
+		AutoDestruct
+    temporary_string := New String(20)
+    print to temporary_string, Global.clock
+    filename.Empty
+    print to filename,"data/",temporary_string:0:10,"_",temporary_string:11:2,temporary_string:14:2,temporary_string:17:2,".dat"
+    print "New filename: ",filename,CR
+    temporary_string.die
+  End
+
+
+; get a list of files on the current SD card
+  To filelist
+	Global.flush_enabled := 0
+    print global.fs:"data" 
+    wait(500);
+	Global.flush_enabled := 1
+  End
+  
+; transfer a file from the SD card
+  To transferfile(transfer_filename)
+	temporary_string := New String(100)
+	print to temporary_string,"data/",transfer_filename
+    try [
+    print "Loading file: ",temporary_string,":",CR
+	Global.flush_enabled := 0
+    
+      fr := global.fs.open(temporary_string,Char,-1)
+      fr.readpoint := 0
+      while fr.Queue [
+        serial.put(fr.get)
+      ]
+      print CR
+      fr.close
+      wait(500);
+      print "Transfer complete",Cr
+	Global.flush_enabled := 1
+    ]
+  End
+  
+; delete a file form the SD card
+  To deletefile(delete_filename)
+	AutoDestruct
+	Global.flush_enabled := 0
+	temporary_string := New String(100)
+	print to temporary_string,"data/",delete_filename
+    try [
+    global.fs.remove(temporary_string)
+    print "File deleted",CR
+	Global.flush_enabled := 1
+    ]
+  End
+
