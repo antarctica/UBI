@@ -1,0 +1,273 @@
+; save a simple status message with time, position, file space and battery voltage
+To save_status
+    Local error_code
+    status_record := global.fs.open("status_record.txt",Char)
+    print to status_record, global.clock.time," : ",global.position," : ",global.fs.free," : ",global.battery_voltage,CR
+    msg.empty
+    status_record.close
+End
+  
+; collect one line of text from modem
+; strip trailing CRLF
+; timeout 10 seconds if no LF received
+To read_modem
+	Local c
+	Local st := New Stopwatch
+	AutoDestruct
+	iridiumMessage.Empty
+	Do
+	[
+		If iridium_serial.Queue
+		[
+			c := iridium_serial.Get
+			If c <> 10 iridiumMessage.Put(c)
+		]
+	]
+	While c <> 10 AndAlso iridiumMessage.Length < 49 AndAlso st.Time < 10000
+	Print "Msg : ",iridiumMessage,CR
+	
+	If st.Time >= 10000
+		PrintF("modem receive timeout\n")
+		
+	st.Die
+End
+
+; send a command, store response in IridiumMessage
+To iridium_response(cmd)
+	AutoDestruct
+	watchdogTimer.Go
+	IridiumMessage.Empty
+
+	Do	; clear any junk in serial input
+	[
+		iridium_serial.Empty
+		Wait 100
+	]
+	While iridium_serial.Queue 
+
+	Print To iridium_serial,cmd
+	iridium_serial.Put(13)
+	read_modem	; read echo
+	;PrintF("Echo?: \"%s\"\n", IridiumMessage)
+	Print "Echo == cmd?",IridiumMessage = cmd," ",IridiumMessage.Find(cmd),IridiumMessage = "",CR
+	read_modem	; read response
+	PrintF("Cmd: %s Response: %s\n", cmd, IridiumMessage)
+	Return IridiumMessage
+End
+To iridium_response_rx(cmd)
+	AutoDestruct
+	watchdogTimer.Go
+	IridiumMessage.Empty
+
+	Do	; clear any junk in serial input
+	[
+		iridium_serial.Empty
+		Wait 100
+	]
+	While iridium_serial.Queue 
+
+	Print To iridium_serial,cmd
+	iridium_serial.Put(13)
+	read_modem	; read echo
+	;PrintF("Echo?: \"%s\"\n", IridiumMessage)
+	Print "Echo == cmd?",IridiumMessage = cmd," ",IridiumMessage.Find(cmd),IridiumMessage = "",CR
+	read_modem	; read response
+	read_modem	; read response
+	PrintF("Cmd: %s Response: %s\n", cmd, IridiumMessage)
+	Return IridiumMessage
+End
+
+; useful utility to talk directly to the iridium modem
+To Iterm
+	Forever
+	[
+		If serial.Queue iridium_serial.Put(serial.Get)
+		If iridium_serial.Queue serial.Put(iridium_serial.Get)	
+	]
+End
+
+To testMessageReceived
+	AutoDestruct
+	temp_string := New String(300)
+	ti := iridiumMessage.Find(",")+1
+	print to temp_string, iridiumMessage:ti:iridiumMessage.Length
+	ti := ti + temp_string.Find(",")+1
+	temp_string.Empty
+	print to temp_string, iridiumMessage:ti:iridiumMessage.Length
+	ti1 := ti + temp_string.Find(",")
+	temp_string.Empty
+	print to temp_string, iridiumMessage:ti:ti1-ti
+	
+	print "Message received? ",temp_string,":",temp_string.Value
+	if temp_string.Value > 0[ return 0 ]
+	else [ return 1]
+End
+
+; download an updated configuration file
+To receiveConfig
+	AutoDestruct
+	temp_string := New String(300)
+
+	print "Message received, downloading",CR
+	iridiumMessage.Empty
+	iridium_response_rx("AT+SBDRT")
+	print "Downloaded message",iridiumMessage,CR
+	; message of format CONFIG,variable_name: value,variable_name: value
+	temp_string.Empty
+	print to temp_string,iridiumMessage:0:6
+	print "Downloaded config file ? ",temp_string.Compare("CONFIG")
+	return temp_string.Compare("CONFIG")
+End
+
+; parse the configuration file received
+To parseReceivedConfig
+	AutoDestruct
+	variable_name := New String(100)
+	variable_value := New String(100)
+	temp_string := New String(300)
+	print "Valid configuration message received : ",iridiumMessage,CR
+	ti := iridiumMessage.Find(",")+1
+	temp_string.Empty
+	while ti > 0[
+		temp_string.Empty
+		variable_name.Empty
+		variable_value.Empty
+		print to temp_string, iridiumMessage:ti:iridiumMessage.Length
+		print "Temp String ",temp_string,CR
+		print to variable_name, temp_string:0:temp_string.Find(":")
+		if temp_string.Find(",") <> -1[
+			print to variable_value, temp_string:temp_string.Find(":")+1:temp_string.Find(",")-temp_string.Find(":")-1
+			ti := ti + temp_string.Find(",")+1
+		]
+		Else [
+			print to variable_value, temp_string:temp_string.Find(":")+1:temp_string.Length-temp_string.Find(":")-1
+			ti := -1
+
+		]
+		print "Configuration received ",variable_name, "=",variable_value,CR
+		If variable_name.Compare("record_duration") = 0 record_duration := variable_value.Value
+		Else If variable_name.Compare("status_update_frequency") = 0 status_update_frequency := variable_value.Value
+		Else If variable_name.Compare("logging_rate") = 0 logging_rate := variable_value.Value
+		Else Print "Unrecognised configuration variable",variable_name," : ",variable_value,CR
+	]
+End
+
+To sendMessage(text)
+	AutoDestruct
+	IridiumTX.Empty
+	Print To IridiumTX,text
+	temp_string := New String(100)	
+	signal := -1
+	;test iridium
+	iridium_power.On
+  	serial_enable.On
+  
+	Wait(2000)
+	IridiumMessage.Empty
+	iridium_response("AT")
+	;print "IRidium response",iridium_response("AT"),CR
+	If IridiumMessage.Find("OK") = -1 [
+		Print "Error wth Iridium modem"
+		iridium_power.Off
+		Return 0
+	]
+	sum := 0
+	i := 0
+	While i < IridiumTX.Length [
+		sum := sum + (IridiumTX.Get(i) As Int)
+		i := i + 1
+	]
+	c1 := sum >> 8 And 255
+	c2 := sum And 255
+	serial.PrintF("%c   %c",c1,c2)
+	IridiumTX.Empty
+	IridiumTX.PrintF("AT+SBDWB=%d",text.Length)
+	iridium_response(IridiumTX)
+	IridiumTX.Empty
+	IridiumTX.PrintF("%s%c%c",text,c1,c2)
+	iridium_response(IridiumTX)
+	attempts := 0
+	tx_attempts := 0
+	signal := -1
+	
+	While tx_attempts < 5 AndAlso signal = -1 [
+		iridiumMessage.Empty
+		signal := -1
+		While signal = -1 AndAlso attempts < 100[
+			iridium_response("AT+CSQ")
+			attempts := attempts + 1
+			Print "Message",iridiumMessage,CR
+			If iridiumMessage.Find("+CSQ:3") = 0 Or iridiumMessage.Find("+CSQ:4") = 0 Or iridiumMessage.Find("+CSQ:5") = 0[
+				signal := 1
+			]
+			iridiumMessage.Empty
+		]
+	
+		signal := -1
+	
+		;print "Starting term",CR
+		;iterm
+		
+		tx_attempts := tx_attempts + 1
+		iridiumMessage.Empty
+		Print "Trasmitting message"
+		iridium_response("AT+SBDIX")
+		
+		listens := 0
+		While signal = -1 AndAlso listens < 3[
+			signal := iridiumMessage.Find("+SBDIX")
+			Print "Message? ",iridiumMessage,CR
+			If signal = -1[
+				read_modem
+				Print "Message? ",iridiumMessage,CR
+			]
+			signal := iridiumMessage.Find("+SBDIX")
+			listens := listens + 1
+		]
+		If iridiumMessage.Find("+SBDIX: 0,") = 0 Or iridiumMessage.Find("+SBDIX: 1,") = 0 Or iridiumMessage.Find("+SBDIX: 2,") = 0[
+			Print "Successful transmission ",iridiumMessage,CR
+			if testMessageReceived = 0[
+				if receiveConfig = 0[
+					parseReceivedConfig
+				]
+			]
+			
+			
+			
+		]
+		Else [
+			Print "Failed to transmit ",iridiumMessage,CR
+			signal := -1
+			Wait(5000)
+		]
+	]
+	iridium_response("AT+SBD0")
+	Wait(1000)
+	iridium_power.Off
+End
+
+
+To sendStatus
+	AutoDestruct
+	msg.Empty
+	Print To msg,record_duration
+	Print To msg,":"
+	Print To msg,status_update_frequency
+	Print to msg,":"
+	Print to msg,logging_rate
+	Print to msg,":"
+	Print To msg,position
+	Print To msg,":"
+	Print To msg,Global.battery_voltage
+	Print To msg,":"
+	Print To msg,Global.fs.free
+	Print "Sending status message ",msg,CR
+	sendMessage(msg)
+	msg.Empty
+End
+
+
+
+
+
+
