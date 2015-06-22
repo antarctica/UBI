@@ -1,0 +1,604 @@
+; routine for putting the UBI to sleep, then handling its subsequent wakeup
+To sleep(interval)
+	AutoDestruct
+	print "Starting sleep for ",interval," seconds",CR
+	sleepCycles := interval/14
+	print "Sleep cycles ",sleepCycles,CR
+	try[ 
+		if global.fs.valid [ 
+			try global.f.close
+			while global.fs.done < 100[ print "Closing file: ",global.fs.done," ",CR ] 
+			Global.fs.die
+		]
+	]
+	
+        try stop(s1)
+	try spi2.die
+
+	New Digital($2c,PULLED_LOW)
+	New Digital($2d,PULLED_LOW)
+	New Digital($2e,PULLED_LOW)
+	New Digital($2f,PULLED_LOW)
+	New Digital($70,PULLED_LOW)
+	New Digital($71,PULLED_LOW)
+	gps.Off
+	antenna.off ; turn off antenna
+	iridium_power.off
+	wait(1000)
+	serial_enable.off
+        i := 0
+        while ( i < sleepCycles ) [ ; sleep for a day
+	  clock.TimeOut(14)
+	  ;watchdogTimer.Go
+	  i := i + 1
+        ]
+	gps.on
+	serial_enable.on
+	wait(1000)
+	print "Waking up",CR
+	makefs(0)
+End
+
+; shouldn't need this routine
+To enableGPSDebug
+  gps_response("$PASHS,ATL,B","ACK")
+  ; 
+End
+
+;shouldn't need this routine
+To disableGPSDebug
+  gps_response("$PASHS,ATL,OFF","ACK")
+End
+
+;main operation sequence
+To main
+	watchdogTimer.Go
+	Print "Starting operational cycle",CR
+	cycleIndex := 0
+  
+  ; turn on and configure the gps for raw data recording
+  activateGPS
+
+  if (Global.serial_stream = 1)[
+	configureGPS2
+	Forever 
+	    [
+		c := gps_serial.Get
+        	serial.put(c)
+	    ]
+
+  ]
+  configure_gps
+  
+  Forever [
+
+    cycleIndex := cycleIndex + 1
+    Print "Status update test? ",cycleIndex," : ",(cycleIndex Mod status_update_frequency),CR
+    If (cycleIndex Mod status_update_frequency) = 0 [
+      Print "Starting to send status update",CR
+      getBatteryVoltage
+      getPosition
+      save_status
+      sendStatus
+      configure_gps
+    ]
+
+    
+    start_time := clock.Time
+
+    watchdogTimer.Go
+    
+
+
+    ; time management routines
+    
+    make dt DateTime(clock.time)
+    
+    ; calculate how long to record GPS data for.  Should be from now till midnight.
+    secs := dt.hour * 3600 + dt.minute * 60 + dt.second
+    print "Clock settings ",clock.time," ",dt," ",secs," ",86400-secs,CR
+
+    time_left := 86400-secs
+    time_store := record_duration * 3600
+    if (time_store > time_left) [
+	time_store := time_left
+    ]
+    time_sleep := time_left - time_store
+    print "Record duration required ",time_store,CR
+    print "Sleep duration calculated ",time_sleep,CR
+
+
+    ; XXXXXXXXXXXXXX rapid fire test only  XXXXXXXXXXXXXXx
+    ;time_sleep := 3600
+    ;time_store := 3600
+    
+    if (time_sleep > 60) [
+	sleep(time_sleep)
+    ] 
+    ; create a filename of the format YYYY-MM-DD-hhmmss.dat
+    newGPSFileName
+    
+    ; open a file on the first available SD card.
+    global.f := global.fs.open(filename,char)
+    ; store GPS data from now until midnight
+    store_gps2(time_store)
+    
+    global.f.close
+  ]
+End
+
+; calculate battery voltage
+To convertBatteryVoltage (x)
+  ;Return (x+49)/303.0
+  Return (x-7.3)/307.0
+End
+
+; get battery voltage
+To getBatteryVoltage
+	AutoDestruct
+	battery_test.On
+	Wait 2000
+        Global.battery_voltage := convertBatteryVoltage(b1.value)
+	Print "Battery voltage ",Global.battery_voltage, " ",b1.value,CR
+        low_power_cutoff
+	Return Global.battery_voltage
+End
+	
+  
+; if the watchdog timer trips, reset the device
+To WatchdogTask
+    Every 1000
+    [
+        If watchdogTimer.Done
+            system.Reset
+    ]
+End
+
+To store_gps2(duration_) ; routine for storing duration_ seconds of raw gps satellite data
+    AutoDestruct
+    Local st := new StopWatch
+    Local c := 0
+
+    Print "Starting GPS recording until midnight: duration (s) ",duration_,CR
+    
+    tsec := st.Time
+    ic := 0
+    While (tsec<(duration_*1000))
+    [
+        c := gps_serial.Get
+        global.f.put(c)
+        tsec := st.Time
+	ic := ic + 1;
+    ]
+
+    watchdogTimer.Go
+    Print "Finished GPS recording : ",Global.start_time," ",clock.Time,CR
+End
+
+; this routine shouldn't be needed
+To testStore(end_time)
+Local st := new StopWatch
+  While (st.Time < end_time*1000)
+  [
+    print "."
+  ]
+  End
+
+; this routine shouldn't be needed
+; its a useful debug routine for talking
+; directly to the GPS
+To term
+	Forever
+	[
+		If serial.Queue [ 
+      gps_serial.Put(serial.Get)
+      print serial.Get
+    ]
+		If gps_serial.Queue serial.Put(gps_serial.Get)	
+	]
+End
+
+; routine for sending commands to gps
+To gps_response(cmd,answer) 
+    Local c, TimeOut
+		Local st := New Stopwatch
+    AutoDestruct
+     
+    msg.Empty
+    c := 0
+    gps_serial.Empty
+    TimeOut := 10 ; try to transmit message 10 times
+		
+				If (cmd = "") IsFalse [
+					Print "Sending gps command: ",cmd,CR
+					Print To gps_serial, cmd, Chr 10 ; transmit message to gps
+				]
+				
+    While msg.Find(answer) = -1 AndAlso TimeOut  > 0 [
+				msg.Empty
+        TimeOut := TimeOut - 1
+
+			Do
+			[
+				If gps_serial.Queue
+				[
+					c := gps_serial.Get
+					If c <> 13 AndAlso c <> 10 AndAlso msg.Length < 100
+						msg.Put(c)
+				]
+			]
+			While c <> 10 AndAlso st.Time < 30000
+
+			Print "MSG received? ",msg,CR
+    ]
+    If TimeOut = 0[
+        Print "Response ",msg,CR	
+        Return 0
+        ]
+    Else [
+        ;Print "Valid response ",msg,CR
+        Return 1
+    ]
+		st.Die
+End
+
+; set baud rate of GPS to 57600
+; This is because the SD card cannot always
+; log data at 115200
+To setBaudRate
+    print "Setting baud rate",CR
+    gps_serial.speed := 115200
+    
+    gps_response("$PASHS,SPD,B,8","$PASHR,ACK")
+    
+    gps_serial.speed := 57600
+End
+
+To configure_gps
+		Local c := 1
+    Local timeout := 0
+    Local temp_msg := New String(30)
+		AutoDestruct
+    
+    while timeout < 5 [
+      If gps_response("$PASHS,OUT,ALL,B,OFF","$PASHR,ACK") = 0 c := 0
+      Wait (300)
+      If gps_response("$PASHS,NME,ALL,B,OFF","$PASHR,ACK") = 0 c := 0
+      Wait(100)
+      ;if gps_response("$PASHS,ANT,EXT","$PASHR,ACK") = 0 c := 0
+      If gps_response("$PASHS,ATM,NAV,B,ON","$PASHR,ACK") = 0 c := 0
+      Wait(100)
+      If gps_response("$PASHS,ATM,ATR,B,ON","$PASHR,ACK") = 0 c:= 0
+      Wait(100)
+      temp_msg.empty
+      temp_msg.printf("$PASHS,ATM,RNX,B,ON,%d,&SCN,0",logging_rate)
+      ;print to temp_msg,"$PASHS,ATM,RNX,B,ON,",logging_rate,",&SCN,0"
+      If gps_response(temp_msg,"$PASHR,ACK") = 0 c:= 0
+      print "Configuration successful? ",c,CR
+      if c = 1 timeout := 5
+      else [ 
+        c := 1 ; try again
+        timeout := timeout + 1
+      ]
+    ]
+      
+		;gps_response("$PASHS,NME")
+		;gps_response("$PASHS,NME,GGA,B,ON","$PASHR,ACK")
+		;gps_response("$PASHS,NME,GSV,B,ON","$PASHR,ACK")
+		;gps_response("$PASHS,NME,GLL,B,ON","$PASHR,ACK")
+		
+		Return c
+End
+
+; this routine doesn't work
+To configure_gps_RTCM
+		Local c := 1
+    Local timeout := 0
+    Local temp_msg := New String(30)
+		AutoDestruct
+    
+    while timeout < 5 [
+    
+
+      If gps_response("$PASHS,OUT,ALL,B,OFF","$PASHR,ACK") = 0 c := 0
+      Wait (300)
+      If gps_response("$PASHS,NME,ALL,B,OFF","$PASHR,ACK") = 0 c := 0
+      Wait(100)
+      temp_msg.empty
+      temp_msg.printf("$PASHS,RAW,MPC,B,ON,%d",logging_rate)
+      ;print to temp_msg,"$PASHS,ATM,RNX,B,ON,",logging_rate,",&SCN,0"
+      If gps_response(temp_msg,"$PASHR,ACK") = 0 c:= 0
+      print "Configuration successful? ",c,CR
+      if c = 1 timeout := 5
+      else [ 
+        c := 1 ; try again
+        timeout := timeout + 1
+      ]
+    ]
+      
+		;gps_response("$PASHS,NME")
+		;gps_response("$PASHS,NME,GGA,B,ON","$PASHR,ACK")
+		;gps_response("$PASHS,NME,GSV,B,ON","$PASHR,ACK")
+		;gps_response("$PASHS,NME,GLL,B,ON","$PASHR,ACK")
+		
+		Return c
+End
+
+; configure GPS to give a GPGGA NMEA string at 1 Hz.
+To configureGPS2
+	AutoDestruct
+	Local c := 1
+  Local timeout := 0
+  
+	msg.Empty
+	; reset all
+  while timeout < 5 [
+    If gps_response("$PASHS,OUT,ALL,B,OFF","$PASHR,ACK") = 0 c := 0
+    Wait (300)
+
+	  If gps_response("$PASHS,ATM,NAV,B,OFF","$PASHR,ACK") = 0 c := 0
+	  Wait(100)
+    If gps_response("$PASHS,ATM,ATR,B,OFF","$PASHR,ACK") = 0 c:= 0
+	  Wait(100)
+    If gps_response("$PASHS,ATM,RNX,B,OFF","$PASHR,ACK") = 0 c:= 0
+    Wait(100)
+	  If gps_response("$PASHS,NME,ALL,B,OFF","$PASHR,ACK") = 0 c := 0
+	  ; configure GGA on
+	  If gps_response("$PASHS,NME,GGA,B,ON,0.2","$PASHR,ACK") = 0 c:= 0
+	  Wait(100)
+    
+    if c = 1 timeout := 5
+    else [
+      c := 1
+      timeout := timeout + 1
+    ]
+  ]
+	Return c
+End
+
+; routine for getting response to GPS commands.
+To listenToGPS
+  Local c, timeout
+  Local st := New Stopwatch
+  AutoDestruct
+  gps.on
+  serial_enable.on
+  
+  Forever [
+  Do
+		[
+		If gps_serial.queue
+		[
+				c := gps_serial.get
+	  		If c <> 13 AndAlso c <> 10 AndAlso msg.Length < 100
+				msg.Put(c)
+		]
+	]
+	While c <> 13
+  st.time := 0
+	Print "MSG received? ",msg,CR
+  msg.empty
+  ]
+End
+
+; routine for turning on GPS
+To activateGPS
+  AutoDestruct
+  Local st := New Stopwatch
+  gps.On
+  serial_enable.On
+  antenna.On
+
+  msg.Empty
+  c := 0
+  gps_serial.Empty
+	
+  print "Activating GPS",CR
+				
+  While st.Time < 10000 [
+			msg.Empty
+			Do
+			[
+				If gps_serial.Queue
+				[
+					c := gps_serial.Get
+					If c <> 13 AndAlso c <> 10 AndAlso msg.Length < 100
+						msg.Put(c)
+				]
+			]
+			While c <> 10 AndAlso st.Time < 5000
+    ]
+    st.die
+    
+    print "Setting baud rate?",CR
+    if set_baud_rate = 1 [ 
+	setBaudRate
+	set_baud_rate := 0
+	
+    ]
+
+    ;gps_response("$PASHQ,PAR","$PASHR,ACK")
+    wait(100)
+    
+    ;gps_response("$PASHS,RST","$PASHR,ACK")
+    wait(100)
+    gps_response("$PASHS,CFG,DSL","$PASHR,ACK")
+    wait(100)
+    ;gps_serial.speed := 115200
+    
+    ;gps_response("$PASHS,SPD,B,8","$PASHR,ACK")
+    
+    ;gps_serial.speed := 57600
+    
+    ;gps_response("$PASHQ,RIO","PASHR,ACK")
+    ;    gps_response("$PASHQ,RIO","PASHR,ACK")
+    ;        gps_response("$PASHQ,RIO","PASHR,ACK")
+    
+    ;gps_response("$PASHS,GPS,ON,1C,2LW","PASHR,ACK")
+    
+    Print "Activation finished",CR
+    gps_serial.Empty
+    msg.Empty
+End
+  
+; routine for getting lat/long position of GPS
+; also get current time, and set board clock.time to this value
+To getPosition
+		AutoDestruct
+		;local longitude := new String(100)
+    Local st := New Stopwatch
+    Make date DateTime
+    Make temp String(20)
+    position.Empty
+    activateGPS
+    
+		msg.Empty
+    If gps_response("$PASHS,OUT,ALL,B,OFF","$PASHR,ACK") = 0 c := 0
+    Wait (300)
+		If gps_response("$PASHS,ATM,NAV,B,OFF","$PASHR,ACK") = 0 c := 0
+		Wait(100)
+    If gps_response("$PASHS,ATM,ATR,B,OFF","$PASHR,ACK") = 0 c:= 0
+		Wait(100)
+    If gps_response("$PASHS,ATM,RNX,B,OFF","$PASHR,ACK") = 0 c:= 0
+
+  	Print To msg, ",,,"
+		;print to msg,"$GPZDA,103045.50,05,08,2012,00,00" ; 10.30 45.50s, 5th of august 2012
+		While (msg.Find(",,,") = -1) IsFalse and st.time < 1000*60*30 [
+			gps_response("$PASHQ,ZDA,B","$GPZDA")
+			attempts := 0
+			While msg.Find("$GPZDA") = -1 AndAlso attempts < 10[
+			  attempts := attempts + 1
+				Print "GPS message? ",msg," ",attempts,CR
+				gps_response("","$GPZDA")
+			]
+			Print "GPS message?? ",msg,CR
+			Wait(10000)
+		]
+    st.time := 0
+    
+    Try [
+    i := msg.Find(",")
+    print to temp, msg:i+1:2
+    date.hour := temp.value
+    temp.empty
+    print to temp, msg:i+3:2
+    date.minute := temp.value
+    temp.empty
+    print to temp, msg:i+5:2
+    date.second := temp.value
+    temp.empty
+    
+    i := msg.Find(",",i+1)
+    print to temp, msg:i+1:2
+    date.day := temp.value
+    temp.empty
+    i := msg.Find(",",i+1)
+    print to temp, msg:i+1:2
+    date.month := temp.value
+    temp.empty
+    i := msg.Find(",",i+1)
+    print to temp, msg:i+1:4
+    date.year := temp.value
+    temp.empty
+    clock.time := date.time
+    ]
+       
+	Print To msg, ",,,"
+		;print to msg,"$GPGGA,182558.80,6734.1372759,S,06807.5226648,W,1,08,1.1,11.885,M,8.789,M,,*61"
+		While (msg.Find(",,,") = -1) IsFalse and st.time < 1000*60*30  [
+			gps_response("$PASHQ,GGA,B","$GPGGA")
+			attempts := 0
+			While msg.Find("$GPGGA") = -1 AndAlso attempts < 10[
+			  attempts := attempts + 1
+				Print "GPS message? ",msg," ",attempts,CR
+				gps_response("","$GPGGA")
+			]
+			Print "GPS message?? ",msg,CR
+			Wait(10000)
+		]
+    
+    
+
+    if st.time >= 1000*60*30 [ return position ]
+		;print to position,msg,":"
+		Print "GPS message ",msg,CR
+		i := msg.Find(",")
+		i := msg.Find(",",i+1)
+		Print To position, msg:i+1:msg.Find(",",i+1)-i-1
+		i := msg.Find(",",i+1)
+		i := msg.Find(",",i+1)
+		Print To position,","
+		Print To position, msg:i+1:msg.Find(",",i+1)-i-1
+		;position.put(longitude)
+		Print "Position ",position,CR
+    
+
+    temp.die
+		Return position
+End
+
+; routine for listening for commands on the serial port and file handling.
+To serialInterface 
+  Local c
+  Local st := New Stopwatch
+  Local filename_ := New String(50)
+  Local msg_ := New String(100)
+  
+  Forever [
+      msg_.empty
+			Do
+			[
+				If serial.Queue
+				[
+					c := serial.Get
+					If c <> 13 AndAlso c <> 10 AndAlso msg_.Length < 50
+						msg_.Put(c)
+            serial.Put(c)
+				]
+			]
+			While c <> 10 and c <> 13
+      c := 15
+
+			Print "CMD received? ",msg_,CR
+      
+      if msg_.find("AT") = 0 or msg_.find("at") = 0 [
+        print "OK",CR
+        print msg_.find("AT")
+      
+      ]
+      if msg_.Find("filelist") = 0 [
+        print "Filelist command received",CR
+        filelist
+      ]
+      if msg_.find("transfer") = 0 [
+        filename_.empty
+        print to filename_, msg_:msg_.Find(" ")+1:(msg_.length-msg_.Find(" ")-1)
+        print "Transfer file command received: ",filename_,CR
+        transferfile(filename_)
+      ]
+      if msg_.find("delete") = 0 [
+        filename_.Empty
+        print to filename_, msg_:msg_.Find(" ")+1:(msg_.length-msg_.Find(" ")-1)
+        print "Delete file command received: ",filename_,CR
+        deletefile(filename_)
+      ]
+      if msg_.find("test") = 0 [
+        print "Test command received",CR
+        testBattery
+        print "SD card free space",global.fs.free
+        ;testGPS
+      ]
+      
+      if msg_.find("reset") = 0 [
+        print "Resetting GPS in 5 seconds",Cr
+        wait(5000)
+        system.Reset
+      ]
+  ]
+End
+
+
+
+
+
+
